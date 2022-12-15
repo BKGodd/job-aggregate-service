@@ -1,0 +1,127 @@
+# Adapted from template: 
+# https://www.elastic.co/guide/en/elasticsearch/reference/8.4/docker.html#_prepare_the_environment
+
+version: '3'
+
+services:
+
+  setup:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.4.3
+    container_name: setup_certs
+    volumes:
+      - certs:/usr/share/elasticsearch/config/certs
+    user: "0"
+    command: >
+      bash -c '
+        if [ x${ELASTIC_PASSWORD} == x ]; then
+          echo "Set the ELASTIC_PASSWORD environment variable in the .env file";
+          exit 1;
+        fi;
+        if [ ! -f config/certs/ca.zip ]; then
+          echo "Creating CA";
+          bin/elasticsearch-certutil ca --silent --pem -out config/certs/ca.zip;
+          unzip config/certs/ca.zip -d config/certs;
+        fi;
+        if [ ! -f config/certs/certs.zip ]; then
+          echo "Creating certs";
+          echo -ne \
+          "instances:\n"\
+          "  - name: esdb\n"\
+          "    dns:\n"\
+          "      - esdb\n"\
+          "      - localhost\n"\
+          "    ip:\n"\
+          "      - 127.0.0.1\n"\
+          > config/certs/instances.yml;
+          bin/elasticsearch-certutil cert --silent --pem -out config/certs/certs.zip --in config/certs/instances.yml --ca-cert config/certs/ca/ca.crt --ca-key config/certs/ca/ca.key;
+          unzip config/certs/certs.zip -d config/certs;
+        fi;
+        echo "Setting file permissions"
+        chown -R root:root config/certs;
+        chmod 755 -R config/certs;
+        echo "Waiting for Elasticsearch availability";
+        until curl -s --cacert config/certs/ca/ca.crt https://esdb:${ESDB_PORT} | grep -q "missing authentication credentials"; do sleep 2; done;
+        echo "All done!";
+      '
+    healthcheck:
+      test: ["CMD-SHELL", "[ -f config/certs/esdb/esdb.crt ]"]
+      interval: 1s
+      timeout: 5s
+      retries: 120
+
+
+  esdb:
+    depends_on:
+      setup:
+        condition: service_healthy
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.4.3
+    container_name: esdb
+    environment:
+      - cluster.name=es-cluster
+      - node.name=es-node
+      - cluster.initial_master_nodes=es-node
+      - ESDB_PORT=${ESDB_PORT}
+      - bootstrap.memory_lock=true
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      - xpack.security.enabled=true
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - xpack.security.http.ssl.enabled=true
+      - xpack.security.http.ssl.key=certs/esdb/esdb.key
+      - xpack.security.http.ssl.certificate=certs/esdb/esdb.crt
+      - xpack.security.http.ssl.certificate_authorities=certs/ca/ca.crt
+      - xpack.security.http.ssl.verification_mode=certificate
+      - xpack.security.transport.ssl.enabled=true
+      - xpack.security.transport.ssl.key=certs/esdb/esdb.key
+      - xpack.security.transport.ssl.certificate=certs/esdb/esdb.crt
+      - xpack.security.transport.ssl.certificate_authorities=certs/ca/ca.crt
+      - xpack.security.transport.ssl.verification_mode=certificate
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - certs:/usr/share/elasticsearch/config/certs
+      - data01:/usr/share/elasticsearch/data
+    ports:
+      - "${ESDB_PORT}:${ESDB_PORT}"
+    healthcheck:
+      test:
+        ["CMD-SHELL",
+         "curl -s --cacert config/certs/ca/ca.crt https://localhost:${ESDB_PORT} | grep -q 'missing authentication credentials'"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+
+  app:
+    container_name: job_app
+    depends_on:
+      esdb:
+        condition: service_healthy
+    build:
+      context: ./services/web
+    expose:
+      - 8000
+    volumes:
+      - certs:/usr/share/elasticsearch/config/certs
+    environment:
+      - ESDB_CERT=/usr/share/elasticsearch/config/certs/ca/ca.crt
+      - ESDB_INDEX=jobs
+      - ESDB_PORT=${ESDB_PORT}
+      - EXCEL_URL=${EXCEL_URL}
+      - ELASTIC_USERNAME=${ELASTIC_USERNAME}
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+
+
+  nginx:
+    container_name: job_nginx
+    build: ./services/nginx
+    ports:
+      - ${APP_PORT}:80
+    depends_on:
+      - app
+    
+
+volumes:
+  certs:
+  data01:
